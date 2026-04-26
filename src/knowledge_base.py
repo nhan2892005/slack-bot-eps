@@ -111,9 +111,66 @@ Important notes for querying:
 """
 
 
+def health_task_summary() -> str:
+    """Customer Service task tables (Notion-mirrored)."""
+    return """
+Tables:
+  - `eps-470914.eps_data.health_task_raw`   — one row per Notion task. STRING-only.
+  - `eps-470914.eps_data.health_task_pivot` — exploded one row per (task × user).
+
+Domain:
+  EPS Customer Service team handles back-office support for Health-insurance
+  members: enrollment, plan changes, claims follow-up, document collection,
+  renewal reminders, and escalations from sales agents. Tasks live in Notion
+  and are mirrored to BigQuery via Apps Script.
+
+Columns (raw):
+  - record_id (STRING):     Notion page ID. Unique key.
+  - tasks (STRING):         Task title.
+  - task_summary (STRING):  AI-generated short summary.
+  - task_category (STRING): Bucket — enrollment / claims / document / follow_up / ...
+  - agent (STRING):         Sales agent the task RELATES to. Informational only.
+                            NOT the accountable owner.
+  - responsible (STRING):   CS owner accountable for completion. PRIMARY ownership.
+                            Empty/blank => task was never assigned (process gap).
+  - due_date (STRING):      SLA deadline. Format '%Y-%m-%d %H:%M[:%S]'.
+                            Parse with SAFE.PARSE_TIMESTAMP both formats.
+  - rating (STRING):        Manager-rated priority 0..5. Higher = more urgent.
+                            Cast via SAFE_CAST(rating AS FLOAT64) then INT64.
+                            >= 4 means same-day must-handle.
+  - completed (STRING):     'Yes' or 'No' (lowercase compare).
+  - created_time, last_edited_time (STRING): timestamps in same format as due_date.
+  - created_by, last_edited_by (STRING): Notion user names.
+  - num_comments (STRING):  Comment count on Notion thread (engagement signal).
+                            Cast via SAFE_CAST(... AS FLOAT64) then INT64.
+  - user_tasks (STRING):    Notion user-list field (comma-separated).
+  - comments_json (STRING): Raw thread JSON. Heavy — only read when needed.
+
+Pivot extras (one row per task × responsible-user):
+  - is_overdue, completion_hours, num_participants, num_user_actions,
+    user_id_task, user_real_name, user_display_name, is_primary_responsible.
+  Use raw for task-level counts; pivot for per-user breakdowns or joins on
+  Slack user identity.
+
+Business semantics for querying:
+  - The accountable person is `responsible`. Never aggregate overdue/blame on `agent`.
+  - "Critical overdue":  is_completed=0 AND days_overdue >= 3 AND emergency_task >= 3.
+  - "Stalled":           is_completed=0 AND num_comments <= 1 AND days_since_edit >= 7.
+  - "Unassigned":        TRIM(responsible) = '' or NULL — surface to manager.
+  - All STRING dates need SAFE.PARSE_TIMESTAMP because formats vary
+    ('%Y-%m-%d %H:%M:%S' vs '%Y-%m-%d %H:%M').
+"""
+
+
 def full_schema() -> str:
-    """Return the combined knowledge base for both tables, ready to inject into a prompt."""
-    return pc_mart_summary() + "\n" + health_mart_summary()
+    """Return the combined knowledge base for all tables, ready to inject into a prompt."""
+    return (
+        pc_mart_summary()
+        + "\n"
+        + health_mart_summary()
+        + "\n"
+        + health_task_summary()
+    )
 
 
 if __name__ == "__main__":
