@@ -1,168 +1,155 @@
 """
+Customer Service Daily Reminder — Enhanced
+==========================================
 
-Customer Service Daily Reminder
-================================
+Improvements over v1:
+  - Filters to a single agent (AGENT_FILTER = "Khang Nguyen")
+  - Parses and cleans comments_json before feeding to AI
+  - AI receives full task context (conversation thread, not just metadata)
+  - Generates a professional PDF report (no emojis, no router buttons)
+  - Uploads PDF to Slack; channel message shows only the headline KPIs
+  - Deep per-task narrative analysis instead of data tables
 
-A once-a-day operations job for the EPS Customer Service team
-(Health-insurance backoffice). The flow is:
-
-    1.  BASE_CTE — types raw STRING columns from the Notion-backed external
-        table, classifies each task into an SLA tier
-        (critical_overdue / overdue / due_today / due_soon / open) and flags
-        stalled work (low engagement + no recent edits).
-    2.  Three deterministic roll-ups feed Claude:
-          - per-responsible workload (counts by tier),
-          - critical / overdue task details (must-act-today),
-          - stalled & unassigned task details (slipping through the cracks).
-    3.  Claude returns a structured JSON report (exec_summary, critical[],
-        stuck[], manager_actions[]). All numeric stats come from BigQuery —
-        Claude only narrates and explains WHY each task is stuck.
-    4.  We render the JSON into TWO Slack surfaces:
-          - a rich Canvas (full report — tables, headings, callouts) for the
-            manager to read end-to-end,
-          - a Block Kit message in the channel with the headline KPIs, top
-            critical preview, and a "View full report" button to the canvas.
-
-Run:  python3 cs_reminder.py [--dry-run]
+Usage:
+  python3 cs_reminder.py            # run full flow and post to Slack
+  python3 cs_reminder.py --dry-run  # generate PDF locally only
 """
 
+import io
 import json
+import logging
 import os
 import re
-import logging
+import tempfile
 from datetime import datetime
 from typing import Optional
 
-from src.clients import bq_client, claude, app
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_LEFT, TA_CENTER
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import cm
+from reportlab.platypus import (
+    HRFlowable,
+    PageBreak,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
+
+from src.clients import app, bq_client, claude
 from src.config import MODEL
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+AGENT_FILTER = os.environ.get("CS_AGENT_FILTER", "Khang Nguyen")
 TASK_TABLE = os.environ.get("CS_TASK_TABLE", "eps-470914.eps_data.health_task_raw")
 CS_CHANNEL = os.environ.get("CS_REMINDER_CHANNEL")
 CS_MANAGER_MENTIONS = os.environ.get("CS_MANAGER_MENTIONS", "").strip()
 OVERDUE_LIMIT = int(os.environ.get("CS_OVERDUE_LIMIT", "20"))
 STALLED_LIMIT = int(os.environ.get("CS_STALLED_LIMIT", "15"))
-WORKLOAD_TABLE_LIMIT = int(os.environ.get("CS_WORKLOAD_TABLE_LIMIT", "15"))
-
 
 # ---------------------------------------------------------------------------
-# Business knowledge base — embedded in the LLM system prompt so the model
-# reasons with the same definitions the SQL uses.
+# System prompt — deep domain context for the AI analyst
 # ---------------------------------------------------------------------------
-TASK_KNOWLEDGE_BASE = """
-Domain
-  EPS Customer Service team handles back-office support for Health-insurance
-  members: enrollment, plan changes, claims follow-up, document collection,
-  renewal reminders, escalations from sales agents.
+SYSTEM_PROMPT = f"""You are a senior operations analyst for EPS, a Vietnamese-American
+health insurance brokerage. Your task is to produce a daily briefing for the team manager
+about the Customer Service backlog for sales agent {AGENT_FILTER}'s clients.
 
-Source of truth
-  Tasks live in Notion. An Apps Script mirrors them to BigQuery as the
-  external table `eps-470914.eps_data.health_task_raw` (all columns STRING).
+DOMAIN KNOWLEDGE
+  - CS tasks come from Notion (mirrored to BigQuery). Each task has a Slack thread
+    (comments_json) that records the actual work conversation between CS staff.
+    Staff often write in Vietnamese — read and interpret those threads accurately.
+  - The 'responsible' field is the CS staff accountable for completion.
+  - 'agent' is the sales agent (always {AGENT_FILTER}) — informational only.
+  - Task categories: Scheduling Appointment, Verify Insurance/Network, Resolve Billing
+    Issue, Submit/Follow-up Referral, Call Doctor Office, Call Insurance Company, etc.
+  - Emergency rating 0-5: 4+ means must handle today. 0 = low urgency.
+  - "Critical overdue": open AND days_overdue >= 3 AND emergency >= 3.
+  - "Stalled": open AND num_comments <= 1 AND days_since_edit >= 7.
+  - Multi-person responsible fields (e.g. "Kay Huynh, Dung Ha") indicate shared
+    ownership — a coordination risk that often leads to tasks falling through the cracks.
 
-Field semantics (raw)
-  - record_id        Notion page ID. Unique key.
-  - tasks            Task title.
-  - task_summary     AI-generated short summary.
-  - task_category    Bucket: enrollment / claims / document / follow_up / ...
-  - agent            Sales agent the task RELATES to. Informational only —
-                     NOT the accountable owner.
-  - responsible      CS owner accountable for completion. PRIMARY ownership.
-                     Empty/blank => the task was never assigned (process gap).
-  - due_date         SLA deadline.
-  - rating           Manager-rated priority 0..5. >=4 means same-day must-handle.
-  - completed        'Yes' / 'No'.
-  - num_comments     Comment count on the Notion thread (engagement signal).
-  - last_edited_time Last activity timestamp (proxy for engagement).
+WHAT MAKES A GOOD ANALYSIS
+  - Read the comment threads carefully. They reveal the real status (e.g. "waiting for
+    callback", "referral not received", "client hasn't confirmed yet").
+  - The comment threads are in Vietnamese — translate the key facts into your English analysis.
+  - Identify the specific blocker, not just that a task is overdue.
+  - Name specific people when recommending actions.
+  - Surface patterns across tasks (e.g. referral delays with one clinic, one staff member
+    overloaded, shared-ownership tasks consistently going stale).
+  - The manager reads this to make decisions — be concrete, not generic.
+  - For team_analysis: do NOT describe numbers in table form. Write a paragraph that
+    explains what the distribution actually means — who is carrying the most weight,
+    who has capacity, where coordination overhead is hurting throughput, and what the
+    manager should watch. Mention specific staff names with context.
 
-Tier definitions used by this job
-  - critical_overdue : open AND days_overdue >= 3 AND emergency_task >= 3
-  - overdue          : open AND due_date < today (and not critical)
-  - due_today        : open AND due_date = today
-  - stalled          : open AND num_comments <= 1 AND days_since_edit >= 7
+OUTPUT FORMAT
+  Return exactly ONE JSON object. No prose. No markdown fences. All text in English.
 
-Rules of interpretation
-  • The accountable person is `responsible`. Never blame `agent` for overdue.
-  • emergency_task >= 4 with any overdue is a red flag.
-  • Stalled tasks are the silent risk — not always overdue yet, but unattended.
-  • An empty `responsible` is a process failure. Surface to manager as a
-    queue problem, not as an individual's fault.
-"""
+{{
+  "executive_summary": "2-3 sentences. State total open, total overdue (with critical
+    count), due today, stalled, and name the biggest risk.",
 
-# Claude returns ONE JSON object matching this schema. We render it into
-# Canvas markdown and Block Kit blocks downstream.
-JSON_SCHEMA_DOC = """{
-  "exec_summary": "1-2 Vietnamese sentences. Reference total open, total overdue (and how many are critical), due_today, stalled, and the responsible person carrying the heaviest overdue load.",
-  "critical": [
-    {
-      "responsible": "string",
+  "critical_tasks": [
+    {{
+      "task": "Client name or short task title (max 80 chars)",
+      "responsible": "CS staff name",
+      "category": "task category",
       "due": "YYYY-MM-DD",
       "days_overdue": <int>,
-      "emergency": <int 0..5>,
-      "category": "string",
-      "task": "short Vietnamese title (truncate to ~80 chars)",
-      "why": "ONE Vietnamese sentence grounded in the numeric signals (days_overdue, emergency, num_comments, days_since_edit)."
-    }
+      "emergency": <int 0-5>,
+      "current_status": "One sentence: what has been done so far, drawn from the
+        comment thread.",
+      "blocker": "One sentence: the specific blocker right now.",
+      "recommended_action": "One sentence: concrete action naming who should do what."
+    }}
   ],
-  "stuck": [
-    {
-      "responsible": "string or '(unassigned)'",
-      "reason": "unassigned" | "stalled",
-      "due": "YYYY-MM-DD or null",
-      "days_overdue": <int, may be negative if not overdue yet>,
-      "emergency": <int 0..5>,
-      "category": "string",
-      "task": "short Vietnamese title",
-      "why": "ONE Vietnamese sentence grounded in signals."
-    }
+
+  "stuck_tasks": [
+    {{
+      "task": "...",
+      "responsible": "... or '(unassigned)'",
+      "reason": "unassigned | stalled",
+      "days_since_activity": <int>,
+      "emergency": <int 0-5>,
+      "category": "...",
+      "analysis": "One sentence explaining WHY this is stuck, grounded in the data
+        signals (no comments, no edit, unassigned, shared ownership with no follow-up).",
+      "recommended_action": "One sentence with a specific next step and owner."
+    }}
   ],
-  "manager_actions": [
-    "Concrete bullet referencing a specific person or task count (Vietnamese)."
+
+  "team_analysis": "One paragraph (4-6 sentences) analyzing the workload across the
+    team. Explain what the distribution means in practice — who is overloaded, who has
+    capacity, whether shared-ownership tasks are a risk, and one concrete staffing
+    recommendation for the manager. Reference specific staff names.",
+
+  "risk_summary": "One sentence naming the single highest systemic risk today.",
+
+  "priority_actions": [
+    "Specific, actionable item. Reference a person, a count, or a category. Max 4 items."
   ]
-}"""
+}}
 
-
-SYSTEM_PROMPT = f"""You are the Operations Reminder Assistant for the EPS
-Customer Service team. Each morning you produce ONE structured JSON report
-that downstream code renders into a Slack canvas + channel message for the
-team manager.
-
-{TASK_KNOWLEDGE_BASE}
-
-Output contract
-  Return EXACTLY ONE JSON object matching this shape, with no prose, no
-  preamble, and no markdown code fences:
-
-{JSON_SCHEMA_DOC}
-
-Selection rules
-  - critical[]: pick up to 6 tasks from the "Critical and overdue" input,
-    prioritising tier=critical_overdue, then highest emergency, then largest
-    days_overdue.
-  - stuck[]: pick up to 5 tasks from the "Stalled and unassigned" input.
-    Place reason='unassigned' items first.
-  - manager_actions[]: 2 to 4 concrete bullets. Each must reference either a
-    specific person, a specific count, or a specific category.
-
-WHY-analysis discipline
-  Each `why` is exactly ONE short Vietnamese sentence whose claim is grounded
-  in numeric signals from the data row. Never invent a cause. Examples:
-    - "emergency=5 nhưng 4d overdue, num_comments=0 — chưa được follow up."
-    - "Không edit trong 12 ngày, num_comments=1 — đang bị bỏ quên."
-    - "Chưa assign responsible — process gap, cần gán người ngay."
-
-Language
-  - Narrative fields (exec_summary, task, why, manager_actions) are in
-    Vietnamese. Field-name-like terms (responsible, due, emergency, category)
-    stay in English in prose.
-  - Do not include emojis in JSON values — the renderer adds them.
+Rules:
+  - critical_tasks: up to 6 items. Prioritise tier=critical_overdue, then highest
+    emergency, then largest days_overdue.
+  - stuck_tasks: up to 5 items. Unassigned first.
+  - Every factual claim must be grounded in the data — never invent.
+  - All output fields in English.
 """
 
-
 # ---------------------------------------------------------------------------
-# SQL: one CTE that does typing + tier classification + stalled flag.
+# SQL — all queries filter to AGENT_FILTER
 # ---------------------------------------------------------------------------
-BASE_CTE = f"""
+def _base_cte() -> str:
+    return f"""
 WITH base AS (
   SELECT
     record_id,
@@ -181,9 +168,11 @@ WITH base AS (
       SAFE.PARSE_TIMESTAMP('%Y-%m-%d %H:%M:%S', last_edited_time),
       SAFE.PARSE_TIMESTAMP('%Y-%m-%d %H:%M', last_edited_time)
     )) AS last_edited_date,
-    CAST(SAFE_CAST(num_comments AS FLOAT64) AS INT64) AS num_comments
+    CAST(SAFE_CAST(num_comments AS FLOAT64) AS INT64) AS num_comments,
+    comments_json
   FROM `{TASK_TABLE}`
   WHERE tasks IS NOT NULL
+    AND TRIM(agent) = '{AGENT_FILTER}'
 ),
 tiered AS (
   SELECT
@@ -211,13 +200,13 @@ tiered AS (
 """
 
 
-def query_workload_by_responsible():
-    sql = BASE_CTE + """
+def query_workload_by_responsible() -> list:
+    sql = _base_cte() + """
     SELECT
       responsible,
       COUNTIF(is_completed = 0) AS open_tasks,
       COUNTIF(is_completed = 0 AND tier = 'critical_overdue') AS critical_overdue,
-      COUNTIF(is_completed = 0 AND tier IN ('critical_overdue', 'overdue')) AS overdue_tasks,
+      COUNTIF(is_completed = 0 AND tier IN ('critical_overdue','overdue')) AS overdue_tasks,
       COUNTIF(is_completed = 0 AND tier = 'due_today') AS due_today,
       COUNTIF(is_completed = 0 AND tier = 'due_soon') AS due_soon,
       COUNTIF(is_stalled) AS stalled_tasks,
@@ -230,13 +219,14 @@ def query_workload_by_responsible():
     return [dict(r) for r in bq_client.query(sql).result()]
 
 
-def query_critical_and_overdue(limit: int = OVERDUE_LIMIT):
-    sql = BASE_CTE + f"""
+def query_critical_and_overdue(limit: int = OVERDUE_LIMIT) -> list:
+    sql = _base_cte() + f"""
     SELECT
-      record_id, responsible, agent, task_category, tasks, task_summary,
-      due_date, days_overdue, emergency_task, num_comments, days_since_edit, tier
+      record_id, responsible, task_category, tasks, task_summary,
+      due_date, days_overdue, emergency_task, num_comments, days_since_edit,
+      tier, comments_json
     FROM tiered
-    WHERE is_completed = 0 AND tier IN ('critical_overdue', 'overdue')
+    WHERE is_completed = 0 AND tier IN ('critical_overdue','overdue')
     ORDER BY
       CASE tier WHEN 'critical_overdue' THEN 0 ELSE 1 END,
       emergency_task DESC, days_overdue DESC
@@ -245,16 +235,17 @@ def query_critical_and_overdue(limit: int = OVERDUE_LIMIT):
     return [dict(r) for r in bq_client.query(sql).result()]
 
 
-def query_stalled_and_unassigned(limit: int = STALLED_LIMIT):
-    sql = BASE_CTE + f"""
+def query_stalled_and_unassigned(limit: int = STALLED_LIMIT) -> list:
+    sql = _base_cte() + f"""
     SELECT
       record_id, responsible, task_category, tasks, task_summary,
       due_date, days_overdue, emergency_task, num_comments, days_since_edit,
-      CASE WHEN responsible = '(unassigned)' THEN 'unassigned' ELSE 'stalled' END AS reason
+      CASE WHEN responsible = '(unassigned)' THEN 'unassigned' ELSE 'stalled' END AS reason,
+      comments_json
     FROM tiered
     WHERE is_completed = 0 AND (is_stalled OR responsible = '(unassigned)')
     ORDER BY
-      CASE WHEN responsible = '(unassigned)' THEN 0 ELSE 1 END,
+      CASE WHEN responsible = '(chua phan cong)' THEN 0 ELSE 1 END,
       emergency_task DESC, days_since_edit DESC
     LIMIT {limit}
     """
@@ -262,378 +253,594 @@ def query_stalled_and_unassigned(limit: int = STALLED_LIMIT):
 
 
 # ---------------------------------------------------------------------------
-# Stats are computed deterministically from BigQuery, not by Claude.
+# Data cleaning and enrichment
 # ---------------------------------------------------------------------------
-def compute_stats(workload_rows):
+_SLACK_MENTION = re.compile(r'<@[A-Z0-9]+>')
+_SLACK_PHONE = re.compile(r'<tel:[^|]+\|([^>]+)>')
+_SLACK_URL = re.compile(r'<https?://[^|>]+\|([^>]+)>')
+
+
+def _clean_slack_text(text: str) -> str:
+    text = _SLACK_MENTION.sub('', text)
+    text = _SLACK_PHONE.sub(r'\1', text)
+    text = _SLACK_URL.sub(r'\1', text)
+    return text.strip()
+
+
+def _parse_comments(raw) -> list:
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _comment_context(comments: list, max_comments: int = 6) -> str:
+    """Return the last N comments as a readable block for the LLM."""
+    if not comments:
+        return "(no comments)"
+    recent = comments[-max_comments:]
+    lines = []
+    for c in recent:
+        user = c.get('user', '?')
+        text = _clean_slack_text(c.get('text', ''))[:250]
+        ts = c.get('timestamp', '')
+        lines.append(f"  [{user} | {ts}]: {text}")
+    return "\n".join(lines)
+
+
+def enrich_rows(rows: list) -> list:
+    """Parse comments, clean fields, add derived signals."""
+    enriched = []
+    for r in rows:
+        t = dict(r)
+        comments = _parse_comments(t.pop('comments_json', None))
+        t['parsed_comments'] = comments
+        t['comment_context'] = _comment_context(comments)
+        t['last_commenter'] = comments[-1].get('user', '') if comments else ''
+        t['num_comments'] = int(t.get('num_comments') or 0)
+        t['emergency_task'] = int(t.get('emergency_task') or 0)
+        t['days_overdue'] = int(t.get('days_overdue') or 0)
+        t['days_since_edit'] = int(t.get('days_since_edit') or 0)
+        t['responsible'] = (str(t.get('responsible') or '')).strip() or '(unassigned)'
+        t['task_category'] = (t.get('task_category') or 'unknown').strip()
+        t['tasks'] = (t.get('tasks') or '').strip()
+        t['task_summary'] = (t.get('task_summary') or '').strip()
+        enriched.append(t)
+    return enriched
+
+
+def compute_stats(workload_rows: list) -> dict:
     if not workload_rows:
-        return {
-            "open": 0, "overdue": 0, "critical": 0, "due_today": 0,
-            "stalled": 0, "high_priority_open": 0, "top_overdue_owner": None,
-        }
-    total_open = sum(r["open_tasks"] for r in workload_rows)
-    total_overdue = sum(r["overdue_tasks"] for r in workload_rows)
-    total_critical = sum(r["critical_overdue"] for r in workload_rows)
-    total_due_today = sum(r["due_today"] for r in workload_rows)
-    total_stalled = sum(r["stalled_tasks"] for r in workload_rows)
-    total_high_prio = sum(r["high_priority_open"] for r in workload_rows)
-    # workload_rows already sorted by critical_overdue DESC, overdue_tasks DESC
-    top_owner = workload_rows[0]["responsible"] if workload_rows[0]["overdue_tasks"] > 0 else None
+        return {k: 0 for k in
+                ('open', 'overdue', 'critical', 'due_today', 'stalled', 'high_priority_open')}
     return {
-        "open": total_open,
-        "overdue": total_overdue,
-        "critical": total_critical,
-        "due_today": total_due_today,
-        "stalled": total_stalled,
-        "high_priority_open": total_high_prio,
-        "top_overdue_owner": top_owner,
+        'open': sum(r['open_tasks'] for r in workload_rows),
+        'overdue': sum(r['overdue_tasks'] for r in workload_rows),
+        'critical': sum(r['critical_overdue'] for r in workload_rows),
+        'due_today': sum(r['due_today'] for r in workload_rows),
+        'stalled': sum(r['stalled_tasks'] for r in workload_rows),
+        'high_priority_open': sum(r['high_priority_open'] for r in workload_rows),
     }
 
 
 # ---------------------------------------------------------------------------
-# LLM I/O: render BQ rows into compact tables, ask Claude for JSON, parse.
+# LLM — build enriched task blocks and call Claude
 # ---------------------------------------------------------------------------
-def _render_table(rows, columns) -> str:
-    if not rows:
-        return "(empty)"
-    header = " | ".join(columns)
-    lines = [header, "-" * len(header)]
-    for r in rows:
-        lines.append(" | ".join(str(r.get(c, "")) for c in columns))
-    return "\n".join(lines)
+def _format_task_block(task: dict) -> str:
+    due_str = str(task.get('due_date', 'N/A'))
+    return (
+        f"Task: {task['tasks']}\n"
+        f"Summary: {task.get('task_summary', '')}\n"
+        f"Category: {task['task_category']}\n"
+        f"Responsible: {task['responsible']}\n"
+        f"Due: {due_str} | Days overdue: {task['days_overdue']}\n"
+        f"Emergency: {task['emergency_task']}/5\n"
+        f"Comments: {task['num_comments']} | Days since last edit: {task['days_since_edit']}\n"
+        f"Last person to comment: {task['last_commenter']}\n"
+        f"Recent conversation:\n{task['comment_context']}"
+    )
 
 
-def _strip_code_fence(text: str) -> str:
+def _strip_fence(text: str) -> str:
     text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
+    text = re.sub(r'^```(?:json)?\s*', '', text)
+    text = re.sub(r'\s*```$', '', text)
     return text.strip()
 
 
-def llm_synthesize_json(workload_rows, overdue_rows, stalled_rows) -> dict:
+def llm_generate_report(workload_rows: list, overdue_rows: list, stalled_rows: list) -> dict:
     today = datetime.now().strftime("%Y-%m-%d")
-    user_msg = f"""Today is {today}. Produce the daily JSON report from the data below.
 
-[Workload by responsible]
-{_render_table(workload_rows, [
-    "responsible", "open_tasks", "critical_overdue", "overdue_tasks",
-    "due_today", "due_soon", "stalled_tasks", "high_priority_open",
-])}
+    # Build workload as a structured prose hint — give Claude the numbers so it
+    # can reason, but the JSON schema forces it to output a narrative paragraph.
+    workload_lines = [
+        "Staff member | Open tasks | Critical | Overdue | Due today | Stalled | "
+        "High-priority open | Note"
+    ]
+    for r in workload_rows:
+        name = r['responsible']
+        notes = []
+        if ',' in name:
+            notes.append("shared ownership")
+        if r['critical_overdue'] > 0:
+            notes.append(f"{r['critical_overdue']} critical overdue")
+        if r['overdue_tasks'] >= 3:
+            notes.append("heavy overdue load")
+        if r['stalled_tasks'] > 0:
+            notes.append(f"{r['stalled_tasks']} stalled")
+        note_str = "; ".join(notes) if notes else ""
+        workload_lines.append(
+            f"{name} | {r['open_tasks']} | {r['critical_overdue']} | "
+            f"{r['overdue_tasks']} | {r['due_today']} | {r['stalled_tasks']} | "
+            f"{r['high_priority_open']} | {note_str}"
+        )
 
-[Critical and overdue tasks (top {OVERDUE_LIMIT})]
-{_render_table(overdue_rows, [
-    "tier", "responsible", "due_date", "days_overdue", "emergency_task",
-    "num_comments", "days_since_edit", "task_category", "tasks",
-])}
+    overdue_blocks = "\n\n---\n\n".join(
+        f"[CRITICAL/OVERDUE #{i+1}]\n{_format_task_block(t)}"
+        for i, t in enumerate(overdue_rows)
+    )
 
-[Stalled and unassigned tasks (top {STALLED_LIMIT})]
-{_render_table(stalled_rows, [
-    "reason", "responsible", "due_date", "days_overdue", "emergency_task",
-    "num_comments", "days_since_edit", "task_category", "tasks",
-])}
+    stalled_blocks = "\n\n---\n\n".join(
+        f"[STUCK #{i+1} | reason={t.get('reason','stalled')}]\n{_format_task_block(t)}"
+        for i, t in enumerate(stalled_rows)
+    )
 
-Return ONLY the JSON object.
-"""
+    user_msg = f"""Today: {today}. Agent: {AGENT_FILTER}.
+
+=== WORKLOAD BY RESPONSIBLE ===
+{chr(10).join(workload_lines)}
+
+=== CRITICAL AND OVERDUE TASKS (read comment threads carefully) ===
+{overdue_blocks if overdue_blocks else '(none)'}
+
+=== STUCK AND UNASSIGNED TASKS ===
+{stalled_blocks if stalled_blocks else '(none)'}
+
+Produce the JSON report now."""
+
     response = claude.messages.create(
         model=MODEL,
-        max_tokens=2500,
+        max_tokens=3000,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_msg}],
     )
     raw = response.content[0].text
-    cleaned = _strip_code_fence(raw)
+    cleaned = _strip_fence(raw)
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError as e:
-        logger.error("JSON parse failed: %s\nRaw output:\n%s", e, raw[:2000])
+        logger.error("JSON parse failed: %s\nRaw:\n%s", e, raw[:3000])
         raise
 
 
 # ---------------------------------------------------------------------------
-# Renderer 1 — Slack Canvas (GitHub-flavored markdown, the long-form report).
+# PDF report renderer — professional, no emojis
 # ---------------------------------------------------------------------------
-def render_canvas_markdown(report: dict, stats: dict, workload_rows, today: str) -> str:
-    lines = []
-    lines.append(f"# 🔔 Customer Service Daily Reminder")
-    lines.append(f"**{today}**")
-    lines.append("")
-    lines.append(f"> {report.get('exec_summary', '').strip()}")
-    lines.append("")
-    lines.append("---")
-    lines.append("")
+_DARK = colors.HexColor('#1a1a2e')
+_MID = colors.HexColor('#16213e')
+_ACCENT = colors.HexColor('#0f3460')
+_RULE = colors.HexColor('#cccccc')
+_LIGHT_BG = colors.HexColor('#f5f7fa')
+_RED = colors.HexColor('#c0392b')
+_ORANGE = colors.HexColor('#d35400')
+_GREEN = colors.HexColor('#27ae60')
+_MUTED = colors.HexColor('#666666')
 
-    # KPI row
-    lines.append("## 📊 KPIs")
-    lines.append("")
-    lines.append("| Metric | Count |")
-    lines.append("|---|---:|")
-    lines.append(f"| Total open | **{stats['open']}** |")
-    lines.append(f"| Overdue | **{stats['overdue']}** |")
-    lines.append(f"| 🔥 Critical (≥3d overdue · emergency≥3) | **{stats['critical']}** |")
-    lines.append(f"| Due today | {stats['due_today']} |")
-    lines.append(f"| Stalled (no engagement 7d+) | {stats['stalled']} |")
-    lines.append(f"| High priority open (emergency≥4) | {stats['high_priority_open']} |")
-    lines.append("")
+PAGE_W, PAGE_H = A4
+MARGIN = 2 * cm
 
-    # Workload by responsible
-    lines.append("## 👥 Workload by responsible")
-    lines.append("")
-    lines.append("| Responsible | Open | 🔥 Critical | Overdue | Today | Stalled | Hi-prio |")
-    lines.append("|---|---:|---:|---:|---:|---:|---:|")
-    for r in workload_rows[:WORKLOAD_TABLE_LIMIT]:
-        name = r["responsible"]
-        if r["critical_overdue"] > 0 or r["overdue_tasks"] >= 3:
-            name = f"**{name}**"
-        lines.append(
-            f"| {name} | {r['open_tasks']} | {r['critical_overdue']} | "
-            f"{r['overdue_tasks']} | {r['due_today']} | "
-            f"{r['stalled_tasks']} | {r['high_priority_open']} |"
-        )
-    lines.append("")
 
-    # Critical
-    lines.append("## 🔥 Critical — phải xử lý hôm nay")
-    lines.append("")
-    critical = report.get("critical") or []
-    if not critical:
-        lines.append("_Không có task critical._")
-        lines.append("")
+def _styles():
+    base = getSampleStyleSheet()
+    S = lambda name, **kw: ParagraphStyle(name, **kw)
+    return {
+        'doc_title': S('doc_title', fontName='Helvetica-Bold', fontSize=18,
+                       textColor=_DARK, leading=22, alignment=TA_LEFT),
+        'doc_sub': S('doc_sub', fontName='Helvetica', fontSize=10,
+                     textColor=_MUTED, leading=14, alignment=TA_LEFT),
+        'section_h': S('section_h', fontName='Helvetica-Bold', fontSize=12,
+                       textColor=_ACCENT, leading=16, spaceBefore=14, spaceAfter=4),
+        'task_h': S('task_h', fontName='Helvetica-Bold', fontSize=10,
+                    textColor=_DARK, leading=13, spaceBefore=8, spaceAfter=2),
+        'label': S('label', fontName='Helvetica-Bold', fontSize=8,
+                   textColor=_MUTED, leading=11),
+        'body': S('body', fontName='Helvetica', fontSize=9,
+                  textColor=_DARK, leading=13, spaceAfter=3),
+        'body_vn': S('body_vn', fontName='Helvetica', fontSize=9.5,
+                     textColor=_DARK, leading=14, spaceAfter=4),
+        'meta': S('meta', fontName='Helvetica-Oblique', fontSize=8,
+                  textColor=_MUTED, leading=11),
+        'kpi_val': S('kpi_val', fontName='Helvetica-Bold', fontSize=22,
+                     textColor=_ACCENT, leading=26, alignment=TA_CENTER),
+        'kpi_lbl': S('kpi_lbl', fontName='Helvetica', fontSize=7.5,
+                     textColor=_MUTED, leading=10, alignment=TA_CENTER),
+        'action': S('action', fontName='Helvetica', fontSize=9.5,
+                    textColor=_DARK, leading=14, leftIndent=10, spaceAfter=3),
+        'risk': S('risk', fontName='Helvetica-BoldOblique', fontSize=9.5,
+                  textColor=_RED, leading=13, borderPad=4),
+    }
+
+
+def _kpi_row(stats: dict, st: dict) -> Table:
+    kpis = [
+        ('Open', stats['open']),
+        ('Overdue', stats['overdue']),
+        ('Critical', stats['critical']),
+        ('Due Today', stats['due_today']),
+        ('Stalled', stats['stalled']),
+        ('High Priority', stats['high_priority_open']),
+    ]
+    top = [Paragraph(str(v), st['kpi_val']) for _, v in kpis]
+    bot = [Paragraph(k, st['kpi_lbl']) for k, _ in kpis]
+    tbl = Table([top, bot], colWidths=[(PAGE_W - 2 * MARGIN) / len(kpis)] * len(kpis))
+    tbl.setStyle(TableStyle([
+        ('BOX', (0, 0), (-1, -1), 0.5, _RULE),
+        ('INNERGRID', (0, 0), (-1, -1), 0.5, _RULE),
+        ('BACKGROUND', (0, 0), (-1, -1), _LIGHT_BG),
+        ('TOPPADDING', (0, 0), (-1, -1), 10),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+        ('TEXTCOLOR', (2, 0), (2, 0), _RED if stats['critical'] > 0 else _ACCENT),
+    ]))
+    return tbl
+
+
+def _workload_table(workload_rows: list, st: dict) -> Table:
+    headers = ['Responsible', 'Open', 'Critical', 'Overdue', 'Today', 'Stalled', 'Hi-prio']
+    col_w = [(PAGE_W - 2 * MARGIN) * f for f in [0.32, 0.1, 0.1, 0.11, 0.1, 0.1, 0.1, 0.07]]
+    # drop last col (uneven split OK)
+    col_w = [(PAGE_W - 2 * MARGIN) / len(headers)] * len(headers)
+    col_w[0] = (PAGE_W - 2 * MARGIN) * 0.30
+    rest = ((PAGE_W - 2 * MARGIN) * 0.70) / (len(headers) - 1)
+    col_w = [col_w[0]] + [rest] * (len(headers) - 1)
+
+    def cell(txt, bold=False, color=_DARK, align=TA_CENTER):
+        fn = 'Helvetica-Bold' if bold else 'Helvetica'
+        return Paragraph(str(txt), ParagraphStyle('c', fontName=fn, fontSize=8,
+                                                   textColor=color, alignment=align, leading=11))
+
+    rows = [[cell(h, bold=True, color=_MUTED) for h in headers]]
+    for r in workload_rows:
+        is_alert = r['critical_overdue'] > 0 or r['overdue_tasks'] >= 3
+        name_color = _RED if is_alert else _DARK
+        rows.append([
+            cell(r['responsible'], bold=is_alert, color=name_color, align=TA_LEFT),
+            cell(r['open_tasks']),
+            cell(r['critical_overdue'],
+                 color=_RED if r['critical_overdue'] > 0 else _DARK),
+            cell(r['overdue_tasks'],
+                 color=_ORANGE if r['overdue_tasks'] > 0 else _DARK),
+            cell(r['due_today']),
+            cell(r['stalled_tasks']),
+            cell(r['high_priority_open']),
+        ])
+
+    tbl = Table(rows, colWidths=col_w, repeatRows=1)
+    style = [
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('BACKGROUND', (0, 0), (-1, 0), _ACCENT),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, _LIGHT_BG]),
+        ('GRID', (0, 0), (-1, -1), 0.3, _RULE),
+        ('TOPPADDING', (0, 0), (-1, -1), 5),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+        ('LEFTPADDING', (0, 0), (-1, -1), 6),
+    ]
+    tbl.setStyle(TableStyle(style))
+    return tbl
+
+
+def _task_card(task: dict, index: int, st: dict, is_critical: bool = True) -> list:
+    """Render one task as a sequence of Platypus flowables."""
+    flows = []
+    # Task header
+    em = task.get('emergency', task.get('emergency_task', 0))
+    days = task.get('days_overdue', task.get('days_since_activity', 0))
+    due = task.get('due', str(task.get('due_date', 'N/A')))
+    resp = task.get('responsible', '')
+    cat = task.get('category', task.get('task_category', ''))
+
+    header_color = _RED if (is_critical and em >= 3) else _ORANGE if em >= 2 else _DARK
+    flows.append(Paragraph(
+        f"{index}. {task.get('task', task.get('tasks', ''))}",
+        ParagraphStyle('th', fontName='Helvetica-Bold', fontSize=9.5,
+                       textColor=header_color, leading=13, spaceBefore=6)
+    ))
+
+    # Meta row
+    meta_parts = [f"Responsible: {resp}", f"Category: {cat}", f"Due: {due}"]
+    if is_critical:
+        meta_parts += [f"Days overdue: {days}", f"Emergency: {em}/5"]
     else:
-        for i, t in enumerate(critical, 1):
-            lines.append(f"### {i}. {t['responsible']} — {t.get('category', '')}")
-            lines.append(f"**Task:** {t['task']}  ")
-            lines.append(
-                f"**Due:** {t['due']} · **{t['days_overdue']}d overdue** · "
-                f"**emergency={t['emergency']}**"
-            )
-            lines.append("")
-            lines.append(f"> 🧠 **WHY:** {t['why']}")
-            lines.append("")
+        meta_parts += [f"Days without activity: {days}", f"Emergency: {em}/5"]
+    flows.append(Paragraph("  |  ".join(meta_parts), st['meta']))
 
-    # Stuck
-    lines.append("## 🚧 Đang bị stuck")
-    lines.append("")
-    stuck = report.get("stuck") or []
-    if not stuck:
-        lines.append("_Không có task stuck._")
-        lines.append("")
+    # Analysis fields
+    if is_critical:
+        for lbl, key in [
+            ("Current Status", "current_status"),
+            ("Blocker", "blocker"),
+            ("Recommended Action", "recommended_action"),
+        ]:
+            val = task.get(key, '')
+            if val:
+                flows.append(Paragraph(f"<b>{lbl}:</b> {val}", st['body_vn']))
     else:
-        for t in stuck:
-            tag = "🆕 **UNASSIGNED**" if t.get("reason") == "unassigned" else "⏸ **STALLED**"
-            owner = t["responsible"] if t["responsible"] != "(unassigned)" else "—"
-            lines.append(f"### {tag} · {owner} · {t.get('category', '')}")
-            lines.append(f"**Task:** {t['task']}  ")
-            due_part = t.get("due") or "no due date"
-            days = t.get("days_overdue")
-            if isinstance(days, int) and days > 0:
-                due_part += f" · {days}d overdue"
-            lines.append(f"**Due:** {due_part} · emergency={t['emergency']}")
-            lines.append("")
-            lines.append(f"> 🧠 **WHY:** {t['why']}")
-            lines.append("")
+        for lbl, key in [
+            ("Analysis", "analysis"),
+            ("Recommended Action", "recommended_action"),
+        ]:
+            val = task.get(key, '')
+            if val:
+                flows.append(Paragraph(f"<b>{lbl}:</b> {val}", st['body_vn']))
 
-    # Manager actions
-    lines.append("## ✅ Đề xuất cho manager")
-    lines.append("")
-    actions = report.get("manager_actions") or []
-    if not actions:
-        lines.append("_Không có đề xuất._")
-    else:
-        for i, a in enumerate(actions, 1):
-            lines.append(f"{i}. {a}")
-    lines.append("")
+    flows.append(HRFlowable(width='100%', thickness=0.3, color=_RULE, spaceAfter=4))
+    return flows
 
-    lines.append("---")
-    lines.append(
-        f"_Generated at {datetime.now().strftime('%Y-%m-%d %H:%M')} · "
-        f"source: `{TASK_TABLE}` · model: `{MODEL}`._"
+
+def render_pdf(report: dict, stats: dict, workload_rows: list, today: str) -> bytes:
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=MARGIN, rightMargin=MARGIN,
+        topMargin=MARGIN, bottomMargin=MARGIN,
+        title=f"CS Daily Reminder — {AGENT_FILTER} — {today}",
+        author="EPS Operations",
     )
-    return "\n".join(lines)
+    st = _styles()
+    story = []
+
+    # === Cover / Header ===
+    story.append(Paragraph(f"Customer Service Daily Reminder", st['doc_title']))
+    story.append(Paragraph(
+        f"Agent: {AGENT_FILTER}  |  Report date: {today}  |  "
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        st['doc_sub']
+    ))
+    story.append(Spacer(1, 0.3 * cm))
+    story.append(HRFlowable(width='100%', thickness=1.5, color=_ACCENT, spaceAfter=10))
+
+    # === Executive Summary ===
+    story.append(Paragraph("Executive Summary", st['section_h']))
+    story.append(Paragraph(report.get('executive_summary', ''), st['body_vn']))
+    story.append(Spacer(1, 0.2 * cm))
+
+    # === KPI Row ===
+    story.append(Paragraph("Key Performance Indicators", st['section_h']))
+    story.append(_kpi_row(stats, st))
+    story.append(Spacer(1, 0.4 * cm))
+
+    # === Risk Summary ===
+    risk = report.get('risk_summary', '')
+    if risk:
+        story.append(Paragraph("Risk Assessment", st['section_h']))
+        story.append(Paragraph(risk, st['risk']))
+        story.append(Spacer(1, 0.2 * cm))
+
+    # === Team Workload Analysis (narrative, no table) ===
+    story.append(Paragraph("Team Workload Analysis", st['section_h']))
+    team_analysis = report.get('team_analysis', '')
+    if team_analysis:
+        story.append(Paragraph(team_analysis, st['body_vn']))
+    story.append(Spacer(1, 0.2 * cm))
+
+    # === Critical Tasks ===
+    critical = report.get('critical_tasks') or []
+    if critical:
+        story.append(PageBreak())
+        story.append(Paragraph("Critical and Overdue Tasks", st['section_h']))
+        story.append(Paragraph(
+            f"The following {len(critical)} tasks require immediate attention.",
+            st['body']
+        ))
+        story.append(Spacer(1, 0.2 * cm))
+        for i, task in enumerate(critical, 1):
+            story.extend(_task_card(task, i, st, is_critical=True))
+
+    # === Stuck / Unassigned Tasks ===
+    stuck = report.get('stuck_tasks') or []
+    if stuck:
+        story.append(Spacer(1, 0.3 * cm))
+        story.append(Paragraph("Stalled and Unassigned Tasks", st['section_h']))
+        story.append(Paragraph(
+            f"{len(stuck)} tasks are stalled or have no assigned owner.",
+            st['body']
+        ))
+        story.append(Spacer(1, 0.2 * cm))
+        for i, task in enumerate(stuck, 1):
+            label = "UNASSIGNED" if task.get('reason') == 'unassigned' else "STALLED"
+            task = dict(task)
+            task['task'] = f"[{label}] {task.get('task', '')}"
+            story.extend(_task_card(task, i, st, is_critical=False))
+
+    # === Priority Actions ===
+    actions = report.get('priority_actions') or []
+    if actions:
+        story.append(PageBreak())
+        story.append(Paragraph("Priority Actions for Manager", st['section_h']))
+        story.append(HRFlowable(width='100%', thickness=0.5, color=_ACCENT, spaceAfter=8))
+        for i, action in enumerate(actions, 1):
+            story.append(Paragraph(f"{i}. {action}", st['action']))
+        story.append(Spacer(1, 0.5 * cm))
+
+    # === Footer ===
+    story.append(HRFlowable(width='100%', thickness=0.5, color=_RULE, spaceBefore=16))
+    story.append(Paragraph(
+        f"Generated by EPS Operations System | Source: {TASK_TABLE} | Model: {MODEL}",
+        st['meta']
+    ))
+
+    doc.build(story)
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
-# Renderer 2 — Block Kit channel notification (the eye-catching summary).
+# Slack integration
 # ---------------------------------------------------------------------------
-def _truncate(s: str, n: int) -> str:
-    return s if len(s) <= n else s[: n - 1] + "…"
+def upload_pdf_to_slack(pdf_bytes: bytes, filename: str, channel_id: str) -> Optional[str]:
+    """Upload PDF to Slack and return the file permalink."""
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as f:
+            f.write(pdf_bytes)
+            tmp_path = f.name
+
+        resp = app.client.files_upload_v2(
+            channel=channel_id,
+            file=tmp_path,
+            filename=filename,
+            title=filename.replace('_', ' ').replace('.pdf', ''),
+        )
+        file_info = resp.get('file', {})
+        return file_info.get('permalink')
+    except Exception as e:
+        logger.warning("files_upload_v2 failed: %s", e)
+        # Fallback to v1
+        try:
+            resp = app.client.files_upload(
+                channels=channel_id,
+                file=pdf_bytes,
+                filename=filename,
+                filetype='pdf',
+            )
+            return resp.get('file', {}).get('permalink')
+        except Exception as e2:
+            logger.error("files_upload fallback also failed: %s", e2)
+            return None
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
 
 
-def render_channel_blocks(
-    report: dict,
-    stats: dict,
-    today: str,
-    canvas_url: Optional[str],
-    mentions: str,
-) -> list:
+def render_channel_blocks(report: dict, stats: dict, today: str,
+                          pdf_permalink: Optional[str], mentions: str) -> list:
+    """Lightweight Block Kit message — overview KPIs + top 3 items only."""
     blocks = []
 
+    # Header
     blocks.append({
         "type": "header",
-        "text": {"type": "plain_text", "text": f"🔔 CS Daily Reminder — {today}", "emoji": True},
+        "text": {
+            "type": "plain_text",
+            "text": f"CS Daily Reminder — {AGENT_FILTER} — {today}",
+            "emoji": False,
+        },
     })
 
-    summary_text = report.get("exec_summary", "").strip() or "(no summary)"
+    # Mentions + summary
+    summary = report.get('executive_summary', '').strip()
     if mentions:
-        summary_text = f"{mentions}\n{summary_text}"
+        summary = f"{mentions}\n{summary}"
     blocks.append({
         "type": "section",
-        "text": {"type": "mrkdwn", "text": summary_text},
+        "text": {"type": "mrkdwn", "text": summary},
     })
 
+    # KPI fields
     blocks.append({
         "type": "section",
         "fields": [
             {"type": "mrkdwn", "text": f"*Open*\n{stats['open']}"},
-            {"type": "mrkdwn", "text": f"*Overdue*\n{stats['overdue']}  _({stats['critical']} 🔥 critical)_"},
-            {"type": "mrkdwn", "text": f"*Due today*\n{stats['due_today']}"},
+            {"type": "mrkdwn",
+             "text": f"*Overdue*\n{stats['overdue']} ({stats['critical']} critical)"},
+            {"type": "mrkdwn", "text": f"*Due Today*\n{stats['due_today']}"},
             {"type": "mrkdwn", "text": f"*Stalled*\n{stats['stalled']}"},
         ],
     })
-
     blocks.append({"type": "divider"})
 
-    critical = report.get("critical") or []
+    # Top 3 critical preview
+    critical = report.get('critical_tasks') or []
     if critical:
-        items = []
+        lines = []
         for t in critical[:3]:
-            items.append(
-                f"• `{t['responsible']}` — {_truncate(t['task'], 80)} "
-                f"_(em={t['emergency']} · {t['days_overdue']}d overdue)_"
+            em = t.get('emergency', 0)
+            days = t.get('days_overdue', 0)
+            lines.append(
+                f"- `{t.get('responsible','')}` — {t.get('task','')[:70]}"
+                f"  _(em={em}, {days}d overdue)_"
             )
         blocks.append({
             "type": "section",
-            "text": {"type": "mrkdwn", "text": "*🔥 Top critical*\n" + "\n".join(items)},
+            "text": {"type": "mrkdwn",
+                     "text": "*Critical tasks (top 3):*\n" + "\n".join(lines)},
         })
 
-    stuck = report.get("stuck") or []
-    if stuck:
-        items = []
-        for t in stuck[:3]:
-            tag = "🆕" if t.get("reason") == "unassigned" else "⏸"
-            owner = t["responsible"] if t["responsible"] != "(unassigned)" else "unassigned"
-            items.append(
-                f"• {tag} `{owner}` — {_truncate(t['task'], 80)} _(em={t['emergency']})_"
-            )
+    # Risk
+    risk = report.get('risk_summary', '')
+    if risk:
         blocks.append({
             "type": "section",
-            "text": {"type": "mrkdwn", "text": "*🚧 Stuck*\n" + "\n".join(items)},
+            "text": {"type": "mrkdwn", "text": f"*Risk:* {risk}"},
         })
 
-    actions = report.get("manager_actions") or []
-    if actions:
-        text = "*✅ Đề xuất cho manager*\n" + "\n".join(f"• {a}" for a in actions)
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": text},
-        })
-
-    if canvas_url:
+    # PDF link
+    if pdf_permalink:
         blocks.append({"type": "divider"})
         blocks.append({
-            "type": "actions",
-            "elements": [{
-                "type": "button",
-                "text": {"type": "plain_text", "text": "📋 Xem báo cáo đầy đủ", "emoji": True},
-                "url": canvas_url,
-                "style": "primary",
-            }],
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"Full report PDF: {pdf_permalink}",
+            },
         })
 
     return blocks
 
 
 # ---------------------------------------------------------------------------
-# Slack canvas creation. Requires `canvases:write` scope on the bot token.
-# Returns the canvas permalink, or None if creation/sharing fails.
-# ---------------------------------------------------------------------------
-def create_and_share_canvas(title: str, markdown: str, channel_id: str) -> Optional[str]:
-    try:
-        resp = app.client.canvases_create(
-            title=title,
-            document_content={"type": "markdown", "markdown": markdown},
-        )
-    except Exception as e:
-        logger.warning("canvases.create failed (missing scope `canvases:write`?): %s", e)
-        return None
-
-    canvas_id = resp.get("canvas_id")
-    if not canvas_id:
-        logger.warning("canvases.create returned no canvas_id: %s", resp)
-        return None
-
-    try:
-        app.client.canvases_access_set(
-            canvas_id=canvas_id,
-            access_level="read",
-            channel_ids=[channel_id],
-        )
-    except Exception as e:
-        logger.warning("canvases.access.set failed: %s", e)
-
-    try:
-        info = app.client.files_info(file=canvas_id)
-        return info.get("file", {}).get("permalink")
-    except Exception as e:
-        logger.warning("files.info failed: %s", e)
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Orchestration.
+# Orchestration
 # ---------------------------------------------------------------------------
 def run_daily_reminder(post: bool = True) -> dict:
+    logger.info("Querying BigQuery for agent: %s", AGENT_FILTER)
     workload_rows = query_workload_by_responsible()
-    overdue_rows = query_critical_and_overdue()
-    stalled_rows = query_stalled_and_unassigned()
+    overdue_rows_raw = query_critical_and_overdue()
+    stalled_rows_raw = query_stalled_and_unassigned()
+
+    # Enrich detail rows with parsed comments
+    overdue_rows = enrich_rows(overdue_rows_raw)
+    stalled_rows = enrich_rows(stalled_rows_raw)
+
     logger.info(
         "rows: workload=%d overdue=%d stalled=%d",
         len(workload_rows), len(overdue_rows), len(stalled_rows),
     )
 
     stats = compute_stats(workload_rows)
-    report = llm_synthesize_json(workload_rows, overdue_rows, stalled_rows)
+    report = llm_generate_report(workload_rows, overdue_rows, stalled_rows)
+
     today = datetime.now().strftime("%Y-%m-%d")
-    canvas_md = render_canvas_markdown(report, stats, workload_rows, today)
+    pdf_bytes = render_pdf(report, stats, workload_rows, today)
 
     if not post:
-        # Dry-run: print the canvas markdown so it can be previewed locally.
-        print(canvas_md)
-        return {"stats": stats, "report": report, "canvas_markdown": canvas_md}
+        out_path = f"/tmp/cs_reminder_{today}.pdf"
+        with open(out_path, 'wb') as f:
+            f.write(pdf_bytes)
+        logger.info("Dry-run: PDF saved to %s", out_path)
+        return {"stats": stats, "report": report, "pdf_path": out_path}
 
     if not CS_CHANNEL:
         raise RuntimeError("CS_REMINDER_CHANNEL is not set.")
 
-    canvas_url = create_and_share_canvas(
-        title=f"CS Daily Reminder — {today}",
-        markdown=canvas_md,
-        channel_id=CS_CHANNEL,
-    )
+    filename = f"CS_Reminder_{AGENT_FILTER.replace(' ', '_')}_{today}.pdf"
+    pdf_permalink = upload_pdf_to_slack(pdf_bytes, filename, CS_CHANNEL)
 
-    blocks = render_channel_blocks(report, stats, today, canvas_url, CS_MANAGER_MENTIONS)
-    fallback_text = f"CS Daily Reminder — {today}: {report.get('exec_summary', '')}"
+    blocks = render_channel_blocks(report, stats, today, pdf_permalink, CS_MANAGER_MENTIONS)
+    fallback = f"CS Daily Reminder — {AGENT_FILTER} — {today}"
 
     msg_resp = app.client.chat_postMessage(
         channel=CS_CHANNEL,
         blocks=blocks,
-        text=fallback_text,
+        text=fallback,
     )
-    logger.info("posted notification to %s", CS_CHANNEL)
-
-    # If canvas wasn't created (missing scope etc.), post the full markdown
-    # as a thread reply so the report is still accessible.
-    if not canvas_url:
-        try:
-            app.client.chat_postMessage(
-                channel=CS_CHANNEL,
-                thread_ts=msg_resp["ts"],
-                text=canvas_md[:39000],
-            )
-            logger.info("posted full markdown as thread fallback")
-        except Exception as e:
-            logger.warning("thread fallback failed: %s", e)
+    logger.info("Posted to %s (ts=%s)", CS_CHANNEL, msg_resp.get('ts'))
 
     return {
         "stats": stats,
         "report": report,
-        "canvas_url": canvas_url,
-        "channel_message_ts": msg_resp.get("ts"),
+        "pdf_permalink": pdf_permalink,
+        "channel_message_ts": msg_resp.get('ts'),
     }
