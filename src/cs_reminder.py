@@ -1,14 +1,17 @@
 """
-Customer Service Daily Reminder — v3 (Insight-Driven)
-======================================================
+Customer Service Daily Reminder — v4 (Signal-to-Noise)
+=======================================================
 
 Philosophy:
-  - BRIEF Slack message: overall KPIs + who has critical/overdue tasks → manager knows where to look
-  - DETAILED PDF: per-staff breakdown → each staff's tasks listed one-by-one with
-    created date, due date, category, LLM-read comment thread → what's stuck and why
-  - Story-telling over numbers: "Quan Nguyen còn 6 task" is useless.
-    "Quan Nguyen - 6 tasks: task A tạo 3 ngày trước đang chờ callback từ provider,
-    task B stuck vì khách chưa confirm..." là đúng.
+  - Classify every task into one of 3 buckets:
+      🔴 NEEDS ATTENTION — blocked, escalation needed, conflicting instructions, stale
+      🟡 MONITORING      — waiting on external party with clear deadline/risk
+      🟢 ON TRACK        — progressing normally, no manager action needed
+  - NEEDS ATTENTION tasks get full story-telling (timeline, who did what, why stuck)
+  - MONITORING tasks get 2-3 sentences (status + follow-up date + risk)
+  - ON TRACK tasks get 1 line (task name + next step + date)
+
+  The result: a 2-3 page PDF instead of 7, with actionable signal front-and-center.
 
 Usage:
   python3 cs_reminder.py            # run full flow and post to Slack
@@ -28,7 +31,7 @@ from typing import Optional
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_LEFT, TA_CENTER
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.platypus import (
     HRFlowable,
@@ -53,9 +56,11 @@ TASK_TABLE = os.environ.get("CS_TASK_TABLE", "eps-470914.eps_data.health_task_ra
 CS_CHANNEL = os.environ.get("CS_REMINDER_CHANNEL")
 CS_MANAGER_MENTIONS = os.environ.get("CS_MANAGER_MENTIONS", "").strip()
 OVERDUE_LIMIT = int(os.environ.get("CS_OVERDUE_LIMIT", "30"))
+# Condensed report toggle: set CS_SHORTEN_REPORT=1|true to enable
+SHORTEN_REPORT = str(os.environ.get("CS_SHORTEN_REPORT", "")).lower() in ("1", "true", "yes")
 
 # ---------------------------------------------------------------------------
-# System prompt — story-telling, per-staff, per-task
+# System prompt — signal-to-noise, 3-bucket classification
 # ---------------------------------------------------------------------------
 _agent_filter_context = (
     f"The report covers only tasks where agent = '{AGENT_FILTER}'."
@@ -64,8 +69,8 @@ _agent_filter_context = (
 )
 
 SYSTEM_PROMPT = f"""You are a senior operations analyst for EPS, a Vietnamese-American
-health insurance brokerage. Your job: produce a daily CS briefing that TELLS A STORY
-about each staff member's workload — not just numbers.
+health insurance brokerage. Your job: produce a daily CS briefing that separates
+SIGNAL from NOISE — surface what needs manager action, compress what does not.
 
 {_agent_filter_context}
 
@@ -73,81 +78,96 @@ DOMAIN KNOWLEDGE
   - CS tasks come from Notion (mirrored to BigQuery). Each task has a Slack thread
     (comments_json) that records the actual work conversation. Staff write in Vietnamese.
   - 'responsible' = the CS staff accountable. 'agent' = the sales agent the task relates to.
-  - Emergency 0–5: >= 4 means handle today. "Critical overdue": open AND days_overdue >= 3 AND emergency >= 3.
+  - Emergency 0-5: >= 4 means handle today.
   - "Stalled": open AND num_comments <= 1 AND days_since_edit >= 7.
   - Multi-person responsible = shared ownership = coordination risk.
 
-STORY-TELLING RULES (CRITICAL)
-  - For each CS staff member: list EVERY open task individually. Don't summarize away the details.
-  - For each task: read the comment thread. What has been done? What is blocking progress?
-    Translate Vietnamese comments accurately. Surface the SPECIFIC blocker.
-  - "6 tasks" alone is useless. Tell the manager: task 1 đang chờ callback từ provider,
-    task 2 khách chưa confirm lịch hẹn, task 3 referral gửi 2 ngày rồi chưa nhận được...
-  - Be concrete: name specific people, providers, dates from comments. Don't invent.
-  - Priority tiers for tasks within each staff section:
-      🔴 critical_overdue (days_overdue >= 3 AND emergency >= 3) — list first
-      🟠 overdue (due_date < today)
-      🟡 due_today
-      🟢 open / in progress
+CLASSIFICATION RULES (CRITICAL)
+  For each open task, read the comment thread carefully and classify into exactly ONE bucket:
+
+  🔴 NEEDS ATTENTION — Manager must act. Criteria (any one is enough):
+    - Blocker persists > 3 days with no workaround
+    - Provider not returning calls after 2+ attempts
+    - Conflicting or unclear instructions from manager/Kay
+    - Escalation needed (past promised timeline, needs supervisor)
+    - Shared ownership with no clear primary driver
+    - Client documents missing with deadline pressure
+    - Complex case with multiple failures (payment misapplied, etc.)
+
+  🟡 MONITORING — No manager action now, but has deadline or risk. Criteria:
+    - Waiting on processing window (insurance claim, bill transfer, etc.)
+    - Waiting on single callback with clear follow-up date
+    - Refund check in transit, payment pending reflection
+    - Task on hold per manager instruction with clear resume date
+
+  🟢 ON TRACK — Normal progress, no issues. Criteria:
+    - Task completed or ready to close
+    - Simple follow-up scheduled, no blockers
+    - Routine verification done, awaiting routine next step
+
+STORY-TELLING DEPTH BY BUCKET
+  🔴 NEEDS ATTENTION: Full story. Read every comment. Build a timeline:
+    when created, key actions taken (with dates), what specifically went wrong
+    or is blocking, who is involved, and ONE concrete recommended action.
+    Translate Vietnamese accurately. Name people, providers, reference numbers.
+    3-6 sentences.
+
+  🟡 MONITORING: Brief status. What is being waited on, when to follow up,
+    what happens if it slips. 2-3 sentences.
+
+  🟢 ON TRACK: One line. Task name + current status + next step date.
 
 JSON SAFETY RULES (CRITICAL):
   - Never use unescaped double-quotes inside a JSON string value.
-  - Never put literal newlines inside a JSON string value.
+  - Never put literal newlines inside a JSON string value. Use spaces instead.
   - Never use smart quotes — ASCII only.
   - Close every array and object.
 
 OUTPUT FORMAT — Return exactly ONE JSON object. No prose. No markdown fences.
 
 {{
-  "executive_summary": "2–3 sentences. Total open/overdue/critical. Single biggest risk. Who is most overloaded.",
+  "executive_summary": "2-3 sentences. Total open tasks, how many need attention, single biggest risk today.",
 
   "overall_stats": {{
     "total_open": <int>,
+    "needs_attention": <int>,
+    "monitoring": <int>,
+    "on_track": <int>,
     "total_overdue": <int>,
-    "total_critical": <int>,
-    "total_due_today": <int>,
     "total_stalled": <int>
   }},
 
-  "staff_detail": [
+  "needs_attention": [
     {{
-      "name": "CS staff name",
-      "open": <int>,
-      "overdue": <int>,
-      "critical": <int>,
-      "due_today": <int>,
-      "stalled": <int>,
-      "load_assessment": "overloaded | manageable | light",
-      "staff_summary": "1–2 sentences. Overall picture of this person's queue. Are they making progress or stuck? Any patterns across their tasks?",
-      "tasks": [
-        {{
-          "task_title": "Short task name / client name",
-          "agent": "Sales agent name",
-          "category": "task category",
-          "created_date": "YYYY-MM-DD",
-          "due_date": "YYYY-MM-DD or N/A",
-          "days_overdue": <int — 0 if not overdue>,
-          "emergency": <int 0-5>,
-          "tier": "critical_overdue | overdue | due_today | due_soon | open | stalled",
-          "progress": "What has been done so far, drawn from comment thread. 1–2 sentences.",
-          "blocker": "The specific thing blocking completion right now, or 'No blocker — actively progressing' if on track.",
-          "action": "One concrete next step. Who does what."
-        }}
-      ],
-      "manager_note": "One sentence: what should the manager do for this staff today, if anything?"
+      "task_title": "Client name - short description",
+      "responsible": "CS staff name",
+      "agent": "Sales agent name",
+      "category": "task category",
+      "created_date": "YYYY-MM-DD",
+      "due_date": "YYYY-MM-DD or N/A",
+      "emergency": <int 0-5>,
+      "story": "Full timeline story. When created, what has been done (with dates), what went wrong, who is involved, specific blocker. 3-6 sentences. Concrete names, providers, reference numbers from the thread.",
+      "blocker": "One sentence: the specific thing blocking progress right now.",
+      "action": "One concrete next step. Who does what, by when."
     }}
   ],
 
-  "critical_alerts": [
+  "monitoring": [
     {{
-      "task": "Task title / client name",
+      "task_title": "Client name - short description",
       "responsible": "CS staff name",
-      "agent": "Sales agent",
-      "category": "category",
-      "days_overdue": <int>,
-      "emergency": <int>,
-      "blocker": "Specific blocker from thread",
-      "action": "Immediate action needed"
+      "agent": "Sales agent name",
+      "status": "2-3 sentences: what is being waited on, when to follow up, risk if delayed.",
+      "follow_up_date": "YYYY-MM-DD or N/A"
+    }}
+  ],
+
+  "on_track": [
+    {{
+      "task_title": "Client name - short description",
+      "responsible": "CS staff name",
+      "agent": "Sales agent name",
+      "one_liner": "One sentence: current status + next step."
     }}
   ],
 
@@ -156,30 +176,38 @@ OUTPUT FORMAT — Return exactly ONE JSON object. No prose. No markdown fences.
       "pattern": "Short label",
       "count": <int>,
       "impact": "One sentence on operational impact.",
-      "recommendation": "One sentence systemic fix."
+      "fix": "One sentence systemic fix."
     }}
   ],
 
-  "team_analysis": "3–4 sentences. Who is overloaded? Who has capacity? Coordination risks? One staffing recommendation.",
-
-  "risk_summary": "One sentence: the single highest systemic risk today.",
-
   "priority_actions": [
-    "Specific actionable item with person/count/category named. Max 4."
+    "Specific actionable item for manager. Max 4 items. Each names who/what/when."
+  ],
+
+  "staff_workload": [
+    {{
+      "name": "Staff name",
+      "total_open": <int>,
+      "attention_count": <int>,
+      "assessment": "overloaded | manageable | light",
+      "note": "One sentence: key observation or recommendation for this person."
+    }}
   ]
 }}
 
 Rules:
-  - staff_detail: one entry per CS staff with open tasks, ordered by overdue DESC.
-  - tasks array: ALL open tasks for that staff, ordered: critical_overdue → overdue → due_today → open.
-  - critical_alerts: top 5 most urgent tasks across all staff (critical_overdue tier first).
+  - needs_attention: ordered by urgency. Include ALL tasks classified as needs_attention.
+  - monitoring: ordered by follow_up_date (soonest first).
+  - on_track: ordered by responsible name.
   - pattern_alerts: max 4, only if count >= 2.
+  - priority_actions: max 4, derived from needs_attention tasks.
+  - staff_workload: one entry per staff with open tasks.
   - All output in English (translate Vietnamese from comments).
   - Every claim grounded in data — never invent.
 """
 
 # ---------------------------------------------------------------------------
-# SQL helpers
+# SQL helpers (unchanged from v3)
 # ---------------------------------------------------------------------------
 def _agent_filter_clause() -> str:
     if AGENT_FILTER:
@@ -245,7 +273,6 @@ tiered AS (
 
 
 def query_all_open_tasks(limit: int = OVERDUE_LIMIT) -> list:
-    """Fetch ALL open tasks with full detail including comments, ordered for story-telling."""
     sql = _base_cte() + f"""
     SELECT
       record_id, agent, responsible, task_category, tasks, task_summary,
@@ -270,7 +297,6 @@ def query_all_open_tasks(limit: int = OVERDUE_LIMIT) -> list:
 
 
 def query_workload_summary() -> list:
-    """High-level per-responsible summary for stats."""
     sql = _base_cte() + """
     SELECT
       responsible,
@@ -289,7 +315,6 @@ def query_workload_summary() -> list:
 
 
 def query_patterns() -> dict:
-    """Category and coordination pattern signals."""
     sql = _base_cte() + """
     SELECT
       task_category,
@@ -325,7 +350,7 @@ def query_patterns() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Data enrichment
+# Data enrichment (unchanged)
 # ---------------------------------------------------------------------------
 _SLACK_MENTION = re.compile(r'<@[A-Z0-9]+>')
 _SLACK_PHONE = re.compile(r'<tel:[^|]+\|([^>]+)>')
@@ -362,6 +387,15 @@ def _comment_context(comments: list, max_comments: int = 8) -> str:
     return "\n".join(lines)
 
 
+def _truncate(text: str, length: int) -> str:
+    if not text:
+        return ''
+    t = text.strip()
+    if len(t) <= length:
+        return t
+    return t[: max(0, length - 3)].rstrip() + '...'
+
+
 def enrich_rows(rows: list) -> list:
     enriched = []
     for r in rows:
@@ -396,7 +430,7 @@ def compute_stats(workload_rows: list) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# LLM — story-telling per staff
+# LLM — signal-to-noise classification
 # ---------------------------------------------------------------------------
 def _format_task_for_llm(task: dict) -> str:
     shared_note = " [SHARED OWNER — coordination risk]" if task.get('is_shared_owner') else ""
@@ -471,31 +505,18 @@ def llm_generate_report(
 ) -> dict:
     today = datetime.now().strftime("%Y-%m-%d")
 
-    # Group tasks by responsible for the prompt
     tasks_by_staff = defaultdict(list)
     for t in all_tasks:
         tasks_by_staff[t['responsible']].append(t)
 
-    # Build staff sections
     staff_sections = []
     for staff_name, tasks in sorted(tasks_by_staff.items(),
                                     key=lambda x: (-sum(1 for t in x[1] if t['tier'] in ('critical_overdue', 'overdue')), -len(x[1]))):
-        overdue_count = sum(1 for t in tasks if t['tier'] in ('critical_overdue', 'overdue'))
-        critical_count = sum(1 for t in tasks if t['tier'] == 'critical_overdue')
-        section = f"\n=== {staff_name} | {len(tasks)} open | {overdue_count} overdue | {critical_count} critical ===\n"
+        section = f"\n=== {staff_name} | {len(tasks)} open tasks ===\n"
         for i, task in enumerate(tasks, 1):
-            tier_label = {
-                'critical_overdue': '🔴 CRITICAL OVERDUE',
-                'overdue': '🟠 OVERDUE',
-                'due_today': '🟡 DUE TODAY',
-                'due_soon': '🔵 DUE SOON',
-                'open': '🟢 OPEN',
-                'no_due_date': '⚪ NO DUE DATE',
-            }.get(task.get('tier', 'open'), '🟢 OPEN')
-            section += f"\n[Task {i} — {tier_label}]\n{_format_task_for_llm(task)}\n"
+            section += f"\n[Task {i}]\n{_format_task_for_llm(task)}\n"
         staff_sections.append(section)
 
-    # Pattern summary
     cat_lines = [f"  {cat}: {cnt} overdue" for cat, cnt in list(patterns['category_overdue'].items())[:5]]
     pattern_block = (
         "Category overdue:\n" + "\n".join(cat_lines) + "\n"
@@ -505,21 +526,23 @@ def llm_generate_report(
 
     user_msg = f"""Today: {today}.
 
-Your job: produce an insight-driven, story-telling report about each CS staff member.
-For EVERY open task: read the comment thread, translate Vietnamese, identify what's been done
-and what is blocking progress. Be specific — name providers, dates, reference numbers from threads.
+Your job: classify each task into NEEDS ATTENTION, MONITORING, or ON TRACK.
+Read every comment thread. Translate Vietnamese. Be specific with names, dates, ref numbers.
+
+NEEDS ATTENTION = manager must act (blocked >3d, escalation needed, conflicting instructions, shared ownership unclear)
+MONITORING = waiting on external party with clear follow-up date
+ON TRACK = progressing normally
+
+For NEEDS ATTENTION: tell the FULL STORY (3-6 sentences with timeline).
+For MONITORING: 2-3 sentences (what waiting on, when follow up, risk).
+For ON TRACK: 1 sentence only.
 
 {chr(10).join(staff_sections)}
 
 === PATTERN SIGNALS ===
 {pattern_block}
 
-OUTPUT RULES:
-- staff_detail: one entry per staff, tasks array = ALL their open tasks (not just overdue).
-- critical_alerts: top 5 most urgent across all staff.
-- pattern_alerts: only count >= 2, max 4.
-- JSON strings: no unescaped double-quotes, no literal newlines, ASCII only.
-- Output ONLY the JSON object."""
+OUTPUT: Only the JSON object. No markdown fences."""
 
     response = claude.messages.create(
         model=MODEL,
@@ -543,7 +566,7 @@ OUTPUT RULES:
 
 
 # ---------------------------------------------------------------------------
-# PDF design
+# PDF design — v4 (condensed, 2-3 pages)
 # ---------------------------------------------------------------------------
 _DARK = colors.HexColor('#1a1a2e')
 _ACCENT = colors.HexColor('#0f3460')
@@ -555,29 +578,13 @@ _GREEN = colors.HexColor('#27ae60')
 _YELLOW = colors.HexColor('#f39c12')
 _MUTED = colors.HexColor('#666666')
 _BLUE = colors.HexColor('#2980b9')
+_PURPLE = colors.HexColor('#8e44ad')
+_RED_BG = colors.HexColor('#fdf2f2')
+_YELLOW_BG = colors.HexColor('#fefce8')
+_GREEN_BG = colors.HexColor('#f0fdf4')
 
 PAGE_W, PAGE_H = A4
 MARGIN = 1.8 * cm
-
-TIER_COLORS = {
-    'critical_overdue': _RED,
-    'overdue': _ORANGE,
-    'due_today': _YELLOW,
-    'due_soon': _BLUE,
-    'open': _GREEN,
-    'no_due_date': _MUTED,
-    'stalled': colors.HexColor('#8e44ad'),
-}
-
-TIER_LABELS = {
-    'critical_overdue': 'CRITICAL',
-    'overdue': 'OVERDUE',
-    'due_today': 'DUE TODAY',
-    'due_soon': 'DUE SOON',
-    'open': 'OPEN',
-    'no_due_date': 'NO DATE',
-    'stalled': 'STALLED',
-}
 
 
 def _styles():
@@ -588,13 +595,11 @@ def _styles():
                                   textColor=_MUTED, leading=14),
         'section_h': ParagraphStyle('section_h', fontName='Helvetica-Bold', fontSize=12,
                                     textColor=_ACCENT, leading=16, spaceBefore=14, spaceAfter=4),
-        'staff_h': ParagraphStyle('staff_h', fontName='Helvetica-Bold', fontSize=11,
-                                  textColor=_DARK, leading=14, spaceBefore=12, spaceAfter=3),
-        'task_label': ParagraphStyle('task_label', fontName='Helvetica-Bold', fontSize=9.5,
-                                     textColor=_DARK, leading=13, spaceBefore=6, spaceAfter=1),
+        'bucket_h': ParagraphStyle('bucket_h', fontName='Helvetica-Bold', fontSize=11,
+                                   textColor=_DARK, leading=14, spaceBefore=10, spaceAfter=4),
         'body': ParagraphStyle('body', fontName='Helvetica', fontSize=9,
                                textColor=_DARK, leading=13, spaceAfter=2),
-        'body_detail': ParagraphStyle('body_detail', fontName='Helvetica', fontSize=9,
+        'body_indent': ParagraphStyle('body_indent', fontName='Helvetica', fontSize=9,
                                       textColor=_DARK, leading=13, spaceAfter=2, leftIndent=10),
         'meta': ParagraphStyle('meta', fontName='Helvetica-Oblique', fontSize=8,
                                textColor=_MUTED, leading=11),
@@ -606,20 +611,24 @@ def _styles():
                                  textColor=_DARK, leading=14, leftIndent=10, spaceAfter=3),
         'risk': ParagraphStyle('risk', fontName='Helvetica-BoldOblique', fontSize=9.5,
                                textColor=_RED, leading=13),
-        'blocker': ParagraphStyle('blocker', fontName='Helvetica-Bold', fontSize=9,
-                                  textColor=_RED, leading=12),
-        'action_item': ParagraphStyle('action_item', fontName='Helvetica-Bold', fontSize=9,
-                                      textColor=_ACCENT, leading=12),
+        'on_track_line': ParagraphStyle('on_track_line', fontName='Helvetica', fontSize=8.5,
+                                        textColor=_DARK, leading=12, leftIndent=10, spaceAfter=1),
+        'staff_line': ParagraphStyle('staff_line', fontName='Helvetica', fontSize=9,
+                                     textColor=_DARK, leading=13, spaceAfter=1),
     }
 
 
-def _kpi_row(stats: dict, st: dict) -> Table:
+def _kpi_row(report: dict, st: dict) -> Table:
+    stats = report.get('overall_stats', {})
     kpis = [
-        ('Open', stats['open'], _ACCENT),
-        ('Overdue', stats['overdue'], _ORANGE if stats['overdue'] > 0 else _ACCENT),
-        ('Critical', stats['critical'], _RED if stats['critical'] > 0 else _ACCENT),
-        ('Due Today', stats['due_today'], _YELLOW if stats['due_today'] > 0 else _ACCENT),
-        ('Stalled', stats['stalled'], colors.HexColor('#8e44ad') if stats['stalled'] > 0 else _ACCENT),
+        ('Open', stats.get('total_open', 0), _ACCENT),
+        ('Needs Attention', stats.get('needs_attention', 0),
+         _RED if stats.get('needs_attention', 0) > 0 else _ACCENT),
+        ('Monitoring', stats.get('monitoring', 0),
+         _YELLOW if stats.get('monitoring', 0) > 0 else _ACCENT),
+        ('On Track', stats.get('on_track', 0), _GREEN),
+        ('Stalled', stats.get('total_stalled', 0),
+         _PURPLE if stats.get('total_stalled', 0) > 0 else _ACCENT),
     ]
     top = [Paragraph(str(v), ParagraphStyle('kv', fontName='Helvetica-Bold', fontSize=22,
                      textColor=c, leading=26, alignment=TA_CENTER)) for _, v, c in kpis]
@@ -636,108 +645,168 @@ def _kpi_row(stats: dict, st: dict) -> Table:
     return tbl
 
 
-def _tier_badge(tier: str) -> Paragraph:
-    color = TIER_COLORS.get(tier, _MUTED)
-    label = TIER_LABELS.get(tier, tier.upper())
-    return Paragraph(
-        f'<font color="#{color.hexval()[2:]}"><b>[{label}]</b></font>',
-        ParagraphStyle('badge', fontName='Helvetica-Bold', fontSize=8.5, leading=11)
-    )
-
-
-def _staff_section(staff: dict, st: dict) -> list:
-    """Render one staff member's full task breakdown."""
+def _render_needs_attention(tasks: list, st: dict, condensed: bool = False) -> list:
+    """Render full story-telling for tasks needing manager action.
+    If `condensed` is True, limit number of items and truncate long text.
+    """
     flows = []
-    name = staff.get('name', '')
-    open_c = staff.get('open', 0)
-    overdue_c = staff.get('overdue', 0)
-    critical_c = staff.get('critical', 0)
-    load = staff.get('load_assessment', 'manageable')
-
-    load_colors = {'overloaded': _RED, 'manageable': _ORANGE, 'light': _GREEN}
-    load_color = load_colors.get(load, _DARK)
-
-    # Staff header
-    flows.append(HRFlowable(width='100%', thickness=1.5, color=_ACCENT, spaceBefore=8, spaceAfter=4))
+    if not tasks:
+        return flows
     flows.append(Paragraph(
-        f'{name} — {open_c} open tasks | {overdue_c} overdue | {critical_c} critical | '
-        f'<font color="#{load_color.hexval()[2:]}"><b>{load.upper()}</b></font>',
-        st['staff_h']
+        '<font color="#c0392b">&#x25cf;</font> Needs Attention',
+        st['section_h']
     ))
+    # Limit items in condensed mode
+    if condensed and len(tasks) > 5:
+        tasks = tasks[:5]
 
-    # Staff summary
-    summary = staff.get('staff_summary', '')
-    if summary:
-        flows.append(Paragraph(summary, st['body']))
+    for i, t in enumerate(tasks, 1):
+        em = t.get('emergency', 0)
+        created = t.get('created_date', 'N/A')
+        due = t.get('due_date', 'N/A')
 
-    # Per-task breakdown
-    tasks = staff.get('tasks', [])
-    for i, task in enumerate(tasks, 1):
-        tier = task.get('tier', 'open')
-        tier_color = TIER_COLORS.get(tier, _MUTED)
-        tier_label = TIER_LABELS.get(tier, tier.upper())
-
-        # Task title row
-        em = task.get('emergency', 0)
-        days_od = task.get('days_overdue', 0)
-        due = task.get('due_date', 'N/A')
-        created = task.get('created_date', 'N/A')
-
-        title_text = f'{i}. {task.get("task_title", "")}'
+        # Title
         flows.append(Paragraph(
-            f'<font color="#{tier_color.hexval()[2:]}"><b>[{tier_label}]</b></font>  '
-            f'<b>{title_text}</b>',
-            ParagraphStyle('tth', fontName='Helvetica-Bold', fontSize=9.5,
-                           textColor=_DARK, leading=13, spaceBefore=7, spaceAfter=1)
+            f'<b>{i}. {t.get("task_title", "")}</b>  '
+            f'<font color="#666666" size="8">{t.get("responsible", "")} | {t.get("category", "")}</font>',
+            ParagraphStyle('att_title', fontName='Helvetica-Bold', fontSize=10,
+                           textColor=_DARK, leading=14, spaceBefore=8, spaceAfter=1)
         ))
 
-        # Meta line
-        meta_parts = [
-            f"Agent: {task.get('agent', 'N/A')}",
-            f"Category: {task.get('category', 'N/A')}",
-            f"Created: {created}",
-            f"Due: {due}",
-        ]
-        if days_od > 0:
-            meta_parts.append(f"Overdue: {days_od}d")
+        # Meta
+        meta_parts = [f"Agent: {t.get('agent', 'N/A')}", f"Created: {created}", f"Due: {due}"]
         if em > 0:
             meta_parts.append(f"Emergency: {em}/5")
         flows.append(Paragraph("  |  ".join(meta_parts), st['meta']))
 
-        # Progress
-        progress = task.get('progress', '')
-        if progress:
-            flows.append(Paragraph(f'<b>Progress:</b> {progress}', st['body_detail']))
+        # Story
+        story = t.get('story', '')
+        if story:
+            if condensed:
+                story = _truncate(story, 300)
+            flows.append(Paragraph(f'<b>Story:</b> {story}', st['body_indent']))
 
         # Blocker
-        blocker = task.get('blocker', '')
-        if blocker and 'no blocker' not in blocker.lower():
+        blocker = t.get('blocker', '')
+        if blocker:
+            if condensed:
+                blocker = _truncate(blocker, 120)
             flows.append(Paragraph(
-                f'<b>⚠ Blocker:</b> {blocker}',
+                f'<font color="#c0392b"><b>Blocker:</b> {blocker}</font>',
                 ParagraphStyle('bl', fontName='Helvetica-Bold', fontSize=9,
-                               textColor=_RED if tier in ('critical_overdue', 'overdue') else _ORANGE,
-                               leading=12, leftIndent=10, spaceAfter=1)
+                               textColor=_RED, leading=12, leftIndent=10, spaceAfter=1)
             ))
 
         # Action
-        action = task.get('action', '')
+        action = t.get('action', '')
         if action:
+            if condensed:
+                action = _truncate(action, 120)
             flows.append(Paragraph(
-                f'<b>→ Action:</b> {action}',
+                f'<font color="#0f3460"><b>&#x2192; Action:</b> {action}</font>',
                 ParagraphStyle('ac', fontName='Helvetica-Bold', fontSize=9,
-                               textColor=_ACCENT, leading=12, leftIndent=10, spaceAfter=2)
+                               textColor=_ACCENT, leading=12, leftIndent=10, spaceAfter=3)
             ))
+    return flows
 
-    # Manager note
-    manager_note = staff.get('manager_note', '')
-    if manager_note:
+
+def _render_monitoring(tasks: list, st: dict, condensed: bool = False) -> list:
+    """Render brief status for monitoring tasks."""
+    flows = []
+    if not tasks:
+        return flows
+    flows.append(Paragraph(
+        '<font color="#d35400">&#x25cf;</font> Monitoring',
+        st['section_h']
+    ))
+    # Limit in condensed mode
+    if condensed and len(tasks) > 8:
+        tasks = tasks[:8]
+
+    for i, t in enumerate(tasks, 1):
+        fu = t.get('follow_up_date', '')
+        fu_str = f" — follow up {fu}" if fu and fu != 'N/A' else ""
         flows.append(Paragraph(
-            f'<b>Manager Note:</b> {manager_note}',
-            ParagraphStyle('mn', fontName='Helvetica-Bold', fontSize=9,
-                           textColor=_DARK, leading=12, spaceBefore=4,
-                           borderPad=4)
+            f'<b>{i}. {t.get("task_title", "")}</b>  '
+            f'<font color="#666666" size="8">({t.get("responsible", "")}){fu_str}</font>',
+            ParagraphStyle('mon_title', fontName='Helvetica-Bold', fontSize=9.5,
+                           textColor=_DARK, leading=13, spaceBefore=5, spaceAfter=1)
         ))
+        status = t.get('status', '')
+        if status:
+            if condensed:
+                status = _truncate(status, 220)
+            flows.append(Paragraph(status, st['body_indent']))
+    return flows
 
+
+def _render_on_track(tasks: list, st: dict, condensed: bool = False) -> list:
+    """Render one-liner list for on-track tasks."""
+    flows = []
+    if not tasks:
+        return flows
+    flows.append(Paragraph(
+        '<font color="#27ae60">&#x25cf;</font> On Track',
+        st['section_h']
+    ))
+    # Group by responsible for compactness
+    by_staff = defaultdict(list)
+    for t in tasks:
+        by_staff[t.get('responsible', '(unknown)')].append(t)
+
+    for staff, staff_tasks in sorted(by_staff.items()):
+        flows.append(Paragraph(
+            f'<b>{staff}</b> ({len(staff_tasks)} tasks)',
+            ParagraphStyle('ot_staff', fontName='Helvetica-Bold', fontSize=9,
+                           textColor=_ACCENT, leading=12, spaceBefore=4, spaceAfter=1)
+        ))
+        # In condensed mode, show up to 3 tasks per staff, otherwise show all
+        display_tasks = staff_tasks if not condensed else staff_tasks[:3]
+        for t in display_tasks:
+            one_liner = t.get('one_liner', t.get('task_title', ''))
+            if condensed:
+                one_liner = _truncate(one_liner, 140)
+            flows.append(Paragraph(
+                f'&#x2022; <b>{t.get("task_title", "")}</b> — {one_liner}',
+                st['on_track_line']
+            ))
+    return flows
+
+
+def _render_patterns(patterns: list, st: dict) -> list:
+    flows = []
+    if not patterns:
+        return flows
+    flows.append(Paragraph("Pattern Alerts", st['section_h']))
+    for p in patterns:
+        flows.append(Paragraph(
+            f'<b>{p.get("pattern", "")} ({p.get("count", 0)} tasks)</b> — {p.get("impact", "")}',
+            ParagraphStyle('pa', fontName='Helvetica', fontSize=9, textColor=_ORANGE,
+                           leading=13, spaceBefore=3)
+        ))
+        fix = p.get('fix', '') or p.get('recommendation', '')
+        if fix:
+            flows.append(Paragraph(f'Fix: {fix}', st['body_indent']))
+    return flows
+
+
+def _render_staff_workload(staff_list: list, st: dict) -> list:
+    flows = []
+    if not staff_list:
+        return flows
+    flows.append(Paragraph("Staff Workload", st['section_h']))
+    for s in staff_list:
+        att = s.get('attention_count', 0)
+        load = s.get('assessment', 'manageable')
+        load_colors = {'overloaded': _RED, 'manageable': _ORANGE, 'light': _GREEN}
+        lc = load_colors.get(load, _DARK)
+        att_str = f'  <font color="#c0392b">({att} needs attention)</font>' if att > 0 else ''
+        flows.append(Paragraph(
+            f'<b>{s.get("name", "")}</b> — {s.get("total_open", 0)} open '
+            f'<font color="#{lc.hexval()[2:]}"><b>[{load.upper()}]</b></font>{att_str}  '
+            f'{s.get("note", "")}',
+            st['staff_line']
+        ))
     return flows
 
 
@@ -754,7 +823,7 @@ def render_pdf(report: dict, stats: dict, today: str) -> bytes:
     st = _styles()
     story = []
 
-    # Header
+    # ── PAGE 1: Action Dashboard ──────────────────────────────────
     story.append(Paragraph("Customer Service Daily Reminder", st['doc_title']))
     story.append(Paragraph(
         f"Coverage: {title_agent}  |  Date: {today}  |  "
@@ -770,51 +839,8 @@ def render_pdf(report: dict, stats: dict, today: str) -> bytes:
     story.append(Spacer(1, 0.15 * cm))
 
     # KPI Row
-    story.append(Paragraph("Backlog Snapshot", st['section_h']))
-    story.append(_kpi_row(stats, st))
+    story.append(_kpi_row(report, st))
     story.append(Spacer(1, 0.2 * cm))
-
-    # Risk
-    risk = report.get('risk_summary', '')
-    if risk:
-        story.append(Paragraph(f"⚠ Highest Risk: {risk}", st['risk']))
-        story.append(Spacer(1, 0.2 * cm))
-
-    # Critical Alerts
-    alerts = report.get('critical_alerts') or []
-    if alerts:
-        story.append(Paragraph("Critical Alerts", st['section_h']))
-        for i, alert in enumerate(alerts, 1):
-            em = alert.get('emergency', 0)
-            days = alert.get('days_overdue', 0)
-            story.append(Paragraph(
-                f"{i}. <b>{alert.get('task', '')}</b> — {alert.get('responsible', '')} "
-                f"[Agent: {alert.get('agent', '')}]",
-                ParagraphStyle('ca', fontName='Helvetica-Bold', fontSize=9.5,
-                               textColor=_RED, leading=13, spaceBefore=5)
-            ))
-            story.append(Paragraph(
-                f"Category: {alert.get('category', '')} | {days}d overdue | Emergency: {em}/5",
-                st['meta']
-            ))
-            if alert.get('blocker'):
-                story.append(Paragraph(f"Blocker: {alert['blocker']}", st['body_detail']))
-            if alert.get('action'):
-                story.append(Paragraph(f"→ {alert['action']}", st['action_item']))
-        story.append(Spacer(1, 0.2 * cm))
-
-    # Pattern Alerts
-    patterns = report.get('pattern_alerts') or []
-    if patterns:
-        story.append(Paragraph("Pattern Alerts", st['section_h']))
-        for p in patterns:
-            story.append(Paragraph(
-                f"<b>{p.get('pattern', '')} ({p.get('count', 0)} tasks)</b> — {p.get('impact', '')}",
-                ParagraphStyle('pa', fontName='Helvetica', fontSize=9, textColor=_ORANGE,
-                               leading=13, spaceBefore=3)
-            ))
-            if p.get('recommendation'):
-                story.append(Paragraph(f"Fix: {p['recommendation']}", st['body_detail']))
 
     # Priority Actions
     actions = report.get('priority_actions') or []
@@ -822,27 +848,28 @@ def render_pdf(report: dict, stats: dict, today: str) -> bytes:
         story.append(Paragraph("Priority Actions for Manager", st['section_h']))
         for i, a in enumerate(actions, 1):
             story.append(Paragraph(f"{i}. {a}", st['action']))
+        story.append(Spacer(1, 0.15 * cm))
 
-    # Per-Staff Task Breakdown (main detailed section)
-    staff_detail = report.get('staff_detail') or []
-    if staff_detail:
-        story.append(PageBreak())
-        story.append(Paragraph("Staff Task Breakdown (Full Detail)", st['section_h']))
-        story.append(Paragraph(
-            "Each staff member's open tasks, with progress and blockers drawn from Slack thread analysis.",
-            st['body']
-        ))
-        for staff in staff_detail:
-            story.extend(_staff_section(staff, st))
+    # 🔴 Needs Attention (full story-telling)
+    story.extend(_render_needs_attention(report.get('needs_attention') or [], st, condensed=SHORTEN_REPORT))
 
-    # Team Analysis
-    team_analysis = report.get('team_analysis', '')
-    if team_analysis:
-        story.append(Spacer(1, 0.3 * cm))
-        story.append(Paragraph("Team Analysis", st['section_h']))
-        story.append(Paragraph(team_analysis, st['body']))
+    # ── PAGE 2: Full Status ───────────────────────────────────────
+    story.append(PageBreak())
+
+    # 🟡 Monitoring
+    story.extend(_render_monitoring(report.get('monitoring') or [], st, condensed=SHORTEN_REPORT))
+
+    # 🟢 On Track
+    story.extend(_render_on_track(report.get('on_track') or [], st, condensed=SHORTEN_REPORT))
+
+    # Pattern Alerts
+    story.extend(_render_patterns(report.get('pattern_alerts') or [], st))
+
+    # Staff Workload
+    story.extend(_render_staff_workload(report.get('staff_workload') or [], st))
 
     # Footer
+    story.append(Spacer(1, 0.3 * cm))
     story.append(HRFlowable(width='100%', thickness=0.5, color=_RULE, spaceBefore=16))
     story.append(Paragraph(
         f"Generated by EPS Operations System | Source: {TASK_TABLE} | Model: {MODEL}",
@@ -854,7 +881,7 @@ def render_pdf(report: dict, stats: dict, today: str) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Slack — BRIEF outside, detail inside PDF
+# Slack — brief outside, detail in PDF
 # ---------------------------------------------------------------------------
 def upload_pdf_to_slack(pdf_bytes: bytes, filename: str, channel_id: str) -> Optional[str]:
     try:
@@ -890,21 +917,15 @@ def render_channel_blocks(
     pdf_permalink: Optional[str],
     mentions: str,
 ) -> list:
-    """
-    BRIEF Slack message:
-    - Overall KPIs
-    - Who has critical/overdue tasks + brief reason
-    - Top critical alerts (3 max)
-    - Link to PDF for full detail
-    """
     blocks = []
     title_agent = AGENT_FILTER if AGENT_FILTER else "All Agents"
+    o_stats = report.get('overall_stats', {})
 
     # Header
     blocks.append({
         "type": "header",
         "text": {"type": "plain_text",
-                 "text": f"📋 CS Daily Reminder — {title_agent} — {today}",
+                 "text": f"CS Daily Reminder — {title_agent} — {today}",
                  "emoji": True},
     })
 
@@ -918,60 +939,43 @@ def render_channel_blocks(
     blocks.append({
         "type": "section",
         "fields": [
-            {"type": "mrkdwn", "text": f"*📂 Open*\n{stats['open']}"},
-            {"type": "mrkdwn", "text": f"*🟠 Overdue*\n{stats['overdue']}"},
-            {"type": "mrkdwn", "text": f"*🔴 Critical*\n{stats['critical']}"},
-            {"type": "mrkdwn", "text": f"*🟡 Due Today*\n{stats['due_today']}"},
+            {"type": "mrkdwn", "text": f"*Open*\n{o_stats.get('total_open', stats.get('open', 0))}"},
+            {"type": "mrkdwn", "text": f"*:red_circle: Needs Attention*\n{o_stats.get('needs_attention', 0)}"},
+            {"type": "mrkdwn", "text": f"*:large_orange_circle: Monitoring*\n{o_stats.get('monitoring', 0)}"},
+            {"type": "mrkdwn", "text": f"*:white_check_mark: On Track*\n{o_stats.get('on_track', 0)}"},
         ],
     })
     blocks.append({"type": "divider"})
 
-    # Per-staff brief: who has issues
-    staff_detail = report.get('staff_detail') or []
-    problem_staff = [s for s in staff_detail if s.get('overdue', 0) > 0 or s.get('critical', 0) > 0]
-    if problem_staff:
+    # Needs attention tasks — brief in Slack
+    att_tasks = report.get('needs_attention') or []
+    if att_tasks:
         lines = []
-        for s in problem_staff[:6]:
-            flags = []
-            if s.get('critical', 0) > 0:
-                flags.append(f"🔴 {s['critical']} critical")
-            if s.get('overdue', 0) > 0:
-                flags.append(f"🟠 {s['overdue']} overdue")
-            if s.get('stalled', 0) > 0:
-                flags.append(f"⚫ {s['stalled']} stalled")
-            flag_str = "  ".join(flags)
-            lines.append(f"*{s.get('name', '')}*  ({s.get('open', 0)} open) — {flag_str}")
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn",
-                     "text": "*⚠️ Staff with urgent tasks:*\n" + "\n".join(lines)},
-        })
-        blocks.append({"type": "divider"})
-
-    # Top 3 critical alerts
-    alerts = report.get('critical_alerts') or []
-    if alerts:
-        lines = []
-        for a in alerts[:3]:
-            days = a.get('days_overdue', 0)
-            blocker = a.get('blocker', '')
-            blocker_short = blocker[:80] + '...' if len(blocker) > 80 else blocker
+        att_limit = 3 if SHORTEN_REPORT else 5
+        for t in att_tasks[:att_limit]:
+            blocker = t.get('blocker', '')
+            max_len = 60 if SHORTEN_REPORT else 80
+            blocker_short = (blocker[:max_len] + '...') if len(blocker) > max_len else blocker
             lines.append(
-                f"• `{a.get('responsible', '')}` — *{a.get('task', '')[:60]}*\n"
-                f"  _{days}d overdue_ | {blocker_short}"
+                f":red_circle: *{t.get('task_title', '')[:50]}* ({t.get('responsible', '')})\n"
+                f"      _{blocker_short}_"
             )
         blocks.append({
             "type": "section",
             "text": {"type": "mrkdwn",
-                     "text": "*🚨 Critical tasks (top 3):*\n" + "\n".join(lines)},
+                     "text": "*Needs Attention:*\n" + "\n".join(lines)},
         })
 
-    # Risk
-    risk = report.get('risk_summary', '')
-    if risk:
+    # Priority actions
+    p_actions = report.get('priority_actions') or []
+    if p_actions:
+        blocks.append({"type": "divider"})
+        action_limit = 2 if SHORTEN_REPORT else 4
+        action_lines = [f"{i}. {a}" for i, a in enumerate(p_actions[:action_limit], 1)]
         blocks.append({
             "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*⚠️ Key Risk:* {risk}"},
+            "text": {"type": "mrkdwn",
+                     "text": "*Priority Actions:*\n" + "\n".join(action_lines)},
         })
 
     # PDF link
@@ -980,13 +984,13 @@ def render_channel_blocks(
         blocks.append({
             "type": "section",
             "text": {"type": "mrkdwn",
-                     "text": f"📄 *Full detail (per-staff, per-task breakdown):* {pdf_permalink}"},
+                     "text": f":page_facing_up: *Full report:* {pdf_permalink}"},
         })
-    elif not pdf_permalink:
+    else:
         blocks.append({
             "type": "section",
             "text": {"type": "mrkdwn",
-                     "text": "_Full task detail: see attached PDF_"},
+                     "text": "_Full report: see attached PDF_"},
         })
 
     return blocks
